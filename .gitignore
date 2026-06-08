@@ -1,4 +1,5 @@
 .env
+empresas.json
 *.pfx
 *.p12
 *.pem
