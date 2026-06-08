@@ -1,0 +1,13 @@
+.env
+*.pfx
+*.p12
+*.pem
+downloads/
+certificados/
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.pyc
