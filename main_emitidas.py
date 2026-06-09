@@ -83,24 +83,28 @@ def sincronizar_emitidas(cfg: dict, inicio: datetime, fim: datetime) -> dict:
         logger.info("  #%s | %s | %s | %s", numero, data, valor, status)
 
         # --- XML ---
-        url_xml = nota.get("download_xml")
+        url_xml = nota.get("download_xml") or nota.get("baixar_xml")
         if url_xml:
-            conteudo = scraper.baixar_xml(url_xml)
-            if conteudo:
+            conteudo, st = scraper.baixar_xml(url_xml)
+            if st == scraper.RESULTADO_SUCESSO and conteudo:
                 (base / "xmls" / f"{numero}.xml").write_bytes(conteudo)
                 xmls += 1
                 logger.info("    XML salvo: %s", numero)
+            elif st == scraper.RESULTADO_MUNICIPAL:
+                logger.info("    XML municipal (403) — requer portal municipal: %s", numero)
             else:
                 erros += 1
 
         # --- PDF (chave pode variar entre portais) ---
-        url_pdf = nota.get("download_danfs-e") or nota.get("download_pdf")
+        url_pdf = nota.get("download_danfs-e") or nota.get("baixar_danfs-e") or nota.get("download_pdf")
         if url_pdf:
-            conteudo = scraper.baixar_pdf(url_pdf)
-            if conteudo:
+            conteudo, st = scraper.baixar_pdf(url_pdf)
+            if st == scraper.RESULTADO_SUCESSO and conteudo:
                 (base / "pdfs" / f"{numero}.pdf").write_bytes(conteudo)
                 pdfs += 1
                 logger.info("    PDF salvo: %s", numero)
+            elif st == scraper.RESULTADO_MUNICIPAL:
+                logger.info("    PDF municipal (403) — requer portal municipal: %s", numero)
             else:
                 erros += 1
 

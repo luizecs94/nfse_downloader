@@ -135,36 +135,44 @@ def _sincronizar_via_portal(cfg: dict, inicio: datetime, fim: datetime) -> dict:
     (base / "xmls").mkdir(parents=True, exist_ok=True)
     (base / "pdfs").mkdir(parents=True, exist_ok=True)
 
-    xmls = pdfs = erros = 0
+    xmls = pdfs = municipais = erros = 0
     for nota in notas_raw:
-        numero = nota.get("numero", "?")
+        numero = nota.get("numero") or nota.get("chave_acesso", "nota")
         logger.info("  #%s | %s | %s | %s",
-                    numero, nota.get("data_emissao"), nota.get("valor"), nota.get("status"))
+                    numero, nota.get("data_emissao", "?"),
+                    nota.get("valor", "?"), nota.get("status", "?"))
+
+        nota_municipal = False
 
         # XML
-        url_xml = nota.get("download_xml")
+        url_xml = nota.get("download_xml") or nota.get("baixar_xml")
         if url_xml:
-            conteudo = scraper.baixar_xml(url_xml)
-            if conteudo:
-                nome = f"{numero or 'nota'}.xml"
-                (base / "xmls" / nome).write_bytes(conteudo)
+            conteudo, status = scraper.baixar_xml(url_xml)
+            if status == scraper.RESULTADO_SUCESSO and conteudo:
+                (base / "xmls" / f"{numero}.xml").write_bytes(conteudo)
                 xmls += 1
+            elif status == scraper.RESULTADO_MUNICIPAL:
+                nota_municipal = True
             else:
                 erros += 1
 
-        # PDF — chave pode ser download_danfs-e ou download_pdf
-        url_pdf = nota.get("download_danfs-e") or nota.get("download_pdf")
+        # PDF — chave pode ser download_danfs-e, baixar_danfs-e ou download_pdf
+        url_pdf = nota.get("download_danfs-e") or nota.get("baixar_danfs-e") or nota.get("download_pdf")
         if url_pdf:
-            conteudo = scraper.baixar_pdf(url_pdf)
-            if conteudo:
-                nome = f"{numero or 'nota'}.pdf"
-                (base / "pdfs" / nome).write_bytes(conteudo)
+            conteudo, status = scraper.baixar_pdf(url_pdf)
+            if status == scraper.RESULTADO_SUCESSO and conteudo:
+                (base / "pdfs" / f"{numero}.pdf").write_bytes(conteudo)
                 pdfs += 1
+            elif status == scraper.RESULTADO_MUNICIPAL:
+                nota_municipal = True
             else:
                 erros += 1
+
+        if nota_municipal:
+            municipais += 1
 
     return {"notas": len(notas_raw), "xmls": xmls, "pdfs": pdfs,
-            "municipais": 0, "erros": erros}
+            "municipais": municipais, "erros": erros}
 
 
 # ------------------------------------------------------------------

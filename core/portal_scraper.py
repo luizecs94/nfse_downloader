@@ -170,7 +170,7 @@ class PortalScraper:
                     tipo, len(notas), data_inicio, data_fim)
         return notas
 
-    def _parsear_tabela(self, content: bytes, tipo: str) -> List[Dict[str, Any]]:
+    def _parsear_tabela(self, content: bytes, tipo: str) -> List[Dict[str, Any]]:  # noqa: C901
         soup = BeautifulSoup(content, "html.parser")
         tbody = soup.find("tbody")
 
@@ -184,43 +184,78 @@ class PortalScraper:
             return []
 
         notas = []
-        for linha in tbody.find_all("tr"):
+        linhas = tbody.find_all("tr")
+        _debug_feito = False
+        for linha in linhas:
             div = linha.find("div", {"class": "list-group menu-content"})
             if not div:
                 continue
 
-            # Status da nota
-            raw = linha.get("data-situacao", "gerada")
+            # Log de diagnóstico na primeira linha (apenas uma vez por listagem)
+            if not _debug_feito and logger.isEnabledFor(logging.DEBUG):
+                logger.debug("HTML primeira linha (attrs): %s", linha.attrs)
+                for i, col in enumerate(linha.find_all("td")):
+                    logger.debug("  td[%d]: %r", i, col.get_text(strip=True))
+                _debug_feito = True
+
+            # Status da nota (data-situacao ou data-status)
+            raw = (
+                linha.get("data-situacao")
+                or linha.get("data-status")
+                or "gerada"
+            )
             status = (raw[0] if isinstance(raw, list) else raw).split("_")[-1].lower()
 
-            # Metadados das colunas
-            data_emissao = numero = ""
-            valor = "0,00"
-            for col in linha.find_all("td"):
-                txt = col.get_text(strip=True)
-                if re.match(r"\d{2}/\d{2}/\d{4}", txt):
-                    data_emissao = txt
-                elif "R$" in txt:
-                    valor = txt
-                elif txt.isdigit() and len(txt) < 15:
-                    numero = txt
+            # Metadados das colunas — tenta primeiro atributos data-* da linha,
+            # depois varre o texto das células
+            numero      = str(linha.get("data-numero", "")).strip()
+            data_emissao = str(linha.get("data-emissao", "")).strip()
+            valor       = str(linha.get("data-valor", "")).strip()
+
+            # Se não achou nos atributos, varre as células de texto
+            if not numero or not data_emissao:
+                for col in linha.find_all("td"):
+                    txt = col.get_text(strip=True)
+                    if not data_emissao and re.match(r"\d{2}/\d{2}/\d{4}", txt):
+                        data_emissao = txt
+                    elif not valor and "R$" in txt:
+                        valor = txt
+                    elif not numero and re.match(r"^\d{1,15}$", txt):
+                        numero = txt
+
+            if not valor:
+                valor = "0,00"
+
+            # Chave de acesso — atributo data-chave ou href dos links
+            chave_acesso = str(linha.get("data-chave", "")).strip()
 
             # Links de ação
             links: Dict[str, Any] = {}
             for a in div.find_all("a"):
+                href = a.get("href", "")
+                if not href:
+                    continue
+                # Extrai a chave de acesso do href se ainda não temos
+                if not chave_acesso:
+                    m = re.search(r"/(\d{44,50})", href)
+                    if m:
+                        chave_acesso = m.group(1)
+                full_url = href if href.startswith("http") else f"https://www.nfse.gov.br{href}"
                 key = a.get_text(strip=True).replace(" ", "_").lower()
-                links[key] = f"https://www.nfse.gov.br{a['href']}"
+                if key:
+                    links[key] = full_url
 
             # Remove ações que não interessam
             for chave in ["cancelar_nfs-e", "substituir", "rejeitar", "confirmar"]:
                 links.pop(chave, None)
 
             links.update({
-                "numero": numero,
-                "data_emissao": data_emissao,
-                "valor": valor,
-                "status": status,
-                "tipo": tipo,
+                "numero":        numero,
+                "data_emissao":  data_emissao,
+                "valor":         valor,
+                "status":        status,
+                "tipo":          tipo,
+                "chave_acesso":  chave_acesso,
             })
             notas.append(links)
 
@@ -230,22 +265,46 @@ class PortalScraper:
     # Download de arquivos
     # ------------------------------------------------------------------
 
-    def baixar_xml(self, url: str) -> Optional[bytes]:
-        """Baixa e retorna o conteúdo do XML da nota."""
+    # ------------------------------------------------------------------
+    # Constantes de resultado de download
+    # ------------------------------------------------------------------
+
+    RESULTADO_SUCESSO   = "sucesso"
+    RESULTADO_MUNICIPAL = "municipal"   # 403 — nota pertence a município local
+    RESULTADO_ERRO      = "erro"
+
+    def baixar_xml(self, url: str) -> tuple[Optional[bytes], str]:
+        """
+        Baixa o XML da nota.
+
+        Returns:
+            (conteudo, status) onde status é um dos valores RESULTADO_*
+        """
         try:
             resp = self._sessao.get(url, timeout=30)
+            if resp.status_code == 403:
+                logger.info("XML municipal (403) — nota requer portal municipal: %s", url)
+                return None, self.RESULTADO_MUNICIPAL
             resp.raise_for_status()
-            return resp.content
+            return resp.content, self.RESULTADO_SUCESSO
         except Exception as exc:
             logger.error("Erro ao baixar XML (%s): %s", url, exc)
-            return None
+            return None, self.RESULTADO_ERRO
 
-    def baixar_pdf(self, url: str) -> Optional[bytes]:
-        """Baixa e retorna o conteúdo do PDF (DANFSE) da nota."""
+    def baixar_pdf(self, url: str) -> tuple[Optional[bytes], str]:
+        """
+        Baixa o PDF (DANFSE) da nota.
+
+        Returns:
+            (conteudo, status) onde status é um dos valores RESULTADO_*
+        """
         try:
             resp = self._sessao.get(url, stream=True, timeout=30)
+            if resp.status_code == 403:
+                logger.info("PDF municipal (403) — nota requer portal municipal: %s", url)
+                return None, self.RESULTADO_MUNICIPAL
             resp.raise_for_status()
-            return resp.content
+            return resp.content, self.RESULTADO_SUCESSO
         except Exception as exc:
             logger.error("Erro ao baixar PDF (%s): %s", url, exc)
-            return None
+            return None, self.RESULTADO_ERRO
