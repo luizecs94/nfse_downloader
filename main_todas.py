@@ -126,11 +126,13 @@ def _sincronizar_via_api(empresa: dict, inicio: datetime, fim: datetime) -> dict
 # ------------------------------------------------------------------
 
 def _sincronizar_via_portal(empresa: dict, inicio: datetime, fim: datetime) -> dict:
-    from core.portal_scraper import FalhaAutenticacaoError, PortalScraper
+    from core.portal_scraper import PortalScraper
+    from core.relatorio_excel import gerar_relatorio
 
-    cnpj = empresa["cnpj"]
+    cnpj   = empresa["cnpj"]
+    nome   = empresa["nome"]
     logger.info("[%s] Modo Portal (scraping) | Período: %s a %s",
-                empresa["nome"], inicio.strftime("%d/%m/%Y"), fim.strftime("%d/%m/%Y"))
+                nome, inicio.strftime("%d/%m/%Y"), fim.strftime("%d/%m/%Y"))
 
     scraper = PortalScraper(cnpj=cnpj, senha=empresa["senha"])
     scraper.autenticar()
@@ -147,42 +149,75 @@ def _sincronizar_via_portal(empresa: dict, inicio: datetime, fim: datetime) -> d
         / inicio.strftime("%Y")
         / inicio.strftime("%m")
     )
-    (base / "xmls").mkdir(parents=True, exist_ok=True)
-    (base / "pdfs").mkdir(parents=True, exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
 
     xmls = pdfs = municipais = erros = 0
+    registros_excel = []
+
     for nota in notas_raw:
-        numero = nota.get("numero") or nota.get("chave_acesso", "nota")
-        logger.info("  #%s | %s | %s | %s",
-                    numero, nota.get("data_emissao", "?"),
-                    nota.get("valor", "?"), nota.get("status", "?"))
+        numero       = nota.get("numero") or ""
+        data_emissao = nota.get("data_emissao", "")
+        valor        = nota.get("valor", "")
+        status_nota  = nota.get("status", "")
+        chave        = nota.get("chave_acesso", "")
+        link_xml     = nota.get("download_xml") or nota.get("baixar_xml") or ""
+        link_pdf     = nota.get("download_danfs-e") or nota.get("baixar_danfs-e") or nota.get("download_pdf") or ""
 
-        nota_municipal = False
+        logger.info("  #%s | %s | %s | %s", numero or chave, data_emissao, valor, status_nota)
 
-        url_xml = nota.get("download_xml") or nota.get("baixar_xml")
-        if url_xml:
-            conteudo, status = scraper.baixar_xml(url_xml)
-            if status == scraper.RESULTADO_SUCESSO and conteudo:
-                (base / "xmls" / f"{numero}.xml").write_bytes(conteudo)
+        nota_captcha = False
+
+        # Tenta download de XML
+        if link_xml:
+            conteudo, st = scraper.baixar_xml(link_xml)
+            if st == scraper.RESULTADO_SUCESSO and conteudo:
+                nome_arquivo = numero or chave or "nota"
+                (base / "xmls").mkdir(exist_ok=True)
+                (base / "xmls" / f"{nome_arquivo}.xml").write_bytes(conteudo)
                 xmls += 1
-            elif status == scraper.RESULTADO_MUNICIPAL:
-                nota_municipal = True
+                link_xml = ""  # já baixado, limpa o link do Excel
+            elif st == scraper.RESULTADO_MUNICIPAL:
+                nota_captcha = True
             else:
                 erros += 1
 
-        url_pdf = nota.get("download_danfs-e") or nota.get("download_pdf") or nota.get("baixar_danfs-e")
-        if url_pdf:
-            conteudo, status = scraper.baixar_pdf(url_pdf)
-            if status == scraper.RESULTADO_SUCESSO and conteudo:
-                (base / "pdfs" / f"{numero}.pdf").write_bytes(conteudo)
+        # Tenta download de PDF
+        if link_pdf:
+            conteudo, st = scraper.baixar_pdf(link_pdf)
+            if st == scraper.RESULTADO_SUCESSO and conteudo:
+                nome_arquivo = numero or chave or "nota"
+                (base / "pdfs").mkdir(exist_ok=True)
+                (base / "pdfs" / f"{nome_arquivo}.pdf").write_bytes(conteudo)
                 pdfs += 1
-            elif status == scraper.RESULTADO_MUNICIPAL:
-                nota_municipal = True
+                link_pdf = ""  # já baixado, limpa o link do Excel
+            elif st == scraper.RESULTADO_MUNICIPAL:
+                nota_captcha = True
             else:
                 erros += 1
 
-        if nota_municipal:
+        if nota_captcha:
             municipais += 1
+
+        # Sempre adiciona ao relatório Excel (mesmo que baixado com sucesso)
+        registros_excel.append({
+            "empresa":      nome,
+            "cnpj":         cnpj,
+            "numero":       numero,
+            "data_emissao": data_emissao,
+            "valor":        valor,
+            "status":       status_nota,
+            "chave_acesso": chave,
+            "link_xml":     link_xml,   # vazio se já baixado
+            "link_pdf":     link_pdf,   # vazio se já baixado
+        })
+
+    # Gera relatório Excel
+    if registros_excel:
+        mes_ano = inicio.strftime("%Y-%m")
+        nome_arquivo = f"relatorio_recebidas_{cnpj}_{mes_ano}.xlsx"
+        caminho_excel = base / nome_arquivo
+        gerar_relatorio(registros_excel, caminho_excel)
+        logger.info("[%s] Relatório Excel salvo em: %s", nome, caminho_excel)
 
     return {"notas": len(notas_raw), "xmls": xmls, "pdfs": pdfs,
             "municipais": municipais, "erros": erros}

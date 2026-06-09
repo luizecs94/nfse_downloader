@@ -118,8 +118,8 @@ def _sincronizar_via_api(cfg: dict, inicio: datetime, fim: datetime) -> dict:
 # ------------------------------------------------------------------
 
 def _sincronizar_via_portal(cfg: dict, inicio: datetime, fim: datetime) -> dict:
-    from core.portal_scraper import FalhaAutenticacaoError, PortalScraper
-    from core.xml_parser import extrair_dados_nfse_string
+    from core.portal_scraper import PortalScraper
+    from core.relatorio_excel import gerar_relatorio
 
     logger.info("Modo Portal (scraping) | Período: %s a %s",
                 inicio.strftime("%d/%m/%Y"), fim.strftime("%d/%m/%Y"))
@@ -127,49 +127,77 @@ def _sincronizar_via_portal(cfg: dict, inicio: datetime, fim: datetime) -> dict:
     scraper = PortalScraper(cnpj=cfg["cnpj"], senha=cfg["senha"])
     scraper.autenticar()
 
-    data_ini_str = inicio.strftime("%d/%m/%Y")
-    data_fim_str = fim.strftime("%d/%m/%Y")
-    notas_raw = scraper.listar_notas("recebidas", data_ini_str, data_fim_str)
+    notas_raw = scraper.listar_notas(
+        "recebidas",
+        inicio.strftime("%d/%m/%Y"),
+        fim.strftime("%d/%m/%Y"),
+    )
 
     base = Path(cfg["download_path"]) / cfg["cnpj"] / inicio.strftime("%Y") / inicio.strftime("%m")
-    (base / "xmls").mkdir(parents=True, exist_ok=True)
-    (base / "pdfs").mkdir(parents=True, exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
 
     xmls = pdfs = municipais = erros = 0
+    registros_excel = []
+
     for nota in notas_raw:
-        numero = nota.get("numero") or nota.get("chave_acesso", "nota")
-        logger.info("  #%s | %s | %s | %s",
-                    numero, nota.get("data_emissao", "?"),
-                    nota.get("valor", "?"), nota.get("status", "?"))
+        numero       = nota.get("numero") or ""
+        data_emissao = nota.get("data_emissao", "")
+        valor        = nota.get("valor", "")
+        status_nota  = nota.get("status", "")
+        chave        = nota.get("chave_acesso", "")
+        link_xml     = nota.get("download_xml") or nota.get("baixar_xml") or ""
+        link_pdf     = nota.get("download_danfs-e") or nota.get("baixar_danfs-e") or nota.get("download_pdf") or ""
 
-        nota_municipal = False
+        logger.info("  #%s | %s | %s | %s", numero or chave, data_emissao, valor, status_nota)
 
-        # XML
-        url_xml = nota.get("download_xml") or nota.get("baixar_xml")
-        if url_xml:
-            conteudo, status = scraper.baixar_xml(url_xml)
-            if status == scraper.RESULTADO_SUCESSO and conteudo:
-                (base / "xmls" / f"{numero}.xml").write_bytes(conteudo)
+        nota_captcha = False
+
+        if link_xml:
+            conteudo, st = scraper.baixar_xml(link_xml)
+            if st == scraper.RESULTADO_SUCESSO and conteudo:
+                nome_arq = numero or chave or "nota"
+                (base / "xmls").mkdir(exist_ok=True)
+                (base / "xmls" / f"{nome_arq}.xml").write_bytes(conteudo)
                 xmls += 1
-            elif status == scraper.RESULTADO_MUNICIPAL:
-                nota_municipal = True
+                link_xml = ""
+            elif st == scraper.RESULTADO_MUNICIPAL:
+                nota_captcha = True
             else:
                 erros += 1
 
-        # PDF — chave pode ser download_danfs-e, baixar_danfs-e ou download_pdf
-        url_pdf = nota.get("download_danfs-e") or nota.get("baixar_danfs-e") or nota.get("download_pdf")
-        if url_pdf:
-            conteudo, status = scraper.baixar_pdf(url_pdf)
-            if status == scraper.RESULTADO_SUCESSO and conteudo:
-                (base / "pdfs" / f"{numero}.pdf").write_bytes(conteudo)
+        if link_pdf:
+            conteudo, st = scraper.baixar_pdf(link_pdf)
+            if st == scraper.RESULTADO_SUCESSO and conteudo:
+                nome_arq = numero or chave or "nota"
+                (base / "pdfs").mkdir(exist_ok=True)
+                (base / "pdfs" / f"{nome_arq}.pdf").write_bytes(conteudo)
                 pdfs += 1
-            elif status == scraper.RESULTADO_MUNICIPAL:
-                nota_municipal = True
+                link_pdf = ""
+            elif st == scraper.RESULTADO_MUNICIPAL:
+                nota_captcha = True
             else:
                 erros += 1
 
-        if nota_municipal:
+        if nota_captcha:
             municipais += 1
+
+        registros_excel.append({
+            "empresa":      cfg.get("empresa", ""),
+            "cnpj":         cfg["cnpj"],
+            "numero":       numero,
+            "data_emissao": data_emissao,
+            "valor":        valor,
+            "status":       status_nota,
+            "chave_acesso": chave,
+            "link_xml":     link_xml,
+            "link_pdf":     link_pdf,
+        })
+
+    if registros_excel:
+        mes_ano = inicio.strftime("%Y-%m")
+        caminho_excel = base / f"relatorio_recebidas_{cfg['cnpj']}_{mes_ano}.xlsx"
+        gerar_relatorio(registros_excel, caminho_excel)
+        logger.info("Relatório Excel salvo em: %s", caminho_excel)
 
     return {"notas": len(notas_raw), "xmls": xmls, "pdfs": pdfs,
             "municipais": municipais, "erros": erros}
