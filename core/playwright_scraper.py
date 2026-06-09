@@ -174,32 +174,113 @@ class PlaywrightScraper:
     # Listagem de notas
     # ------------------------------------------------------------------
 
-    def listar_notas(
+    def listar_e_baixar_notas(
         self,
         tipo: str,
         data_inicio: str,
         data_fim: str,
-    ) -> list[dict]:
+        base_path: Path,
+        nome_empresa: str = "",
+        cnpj: str = "",
+    ) -> dict:
         """
-        Lista notas do período. Retorna lista de dicts com os dados.
-        """
-        url = _URL_EMIT if tipo == "emitidas" else _URL_RECEB
-        self._page.goto(url, wait_until="domcontentloaded")
+        Lista notas do período E faz o download de cada uma clicando
+        diretamente nos links da tabela (sem navegar para URL direta).
 
-        # Preenche filtro de datas
+        Retorna dict com: notas, xmls, pdfs, captchas, erros, registros_excel
+        """
+        from core.relatorio_excel import gerar_relatorio
+
+        url_lista = _URL_EMIT if tipo == "emitidas" else _URL_RECEB
+        page = self._page
+        page.goto(url_lista, wait_until="domcontentloaded")
         self._preencher_filtro_datas(data_inicio, data_fim)
 
-        # Aguarda a tabela carregar
         try:
-            self._page.wait_for_selector("tbody tr", timeout=10_000)
+            page.wait_for_selector("tbody tr", timeout=10_000)
         except Exception:
             logger.info("Nenhuma nota encontrada no período.")
-            return []
+            return {"notas": 0, "xmls": 0, "pdfs": 0, "captchas": 0,
+                    "erros": 0, "registros_excel": []}
 
-        notas = self._extrair_notas_da_pagina(tipo)
+        # Coleta os dados de todas as linhas ANTES de baixar
+        notas_info = self._extrair_notas_da_pagina(tipo)
+        total = len(notas_info)
         logger.info("Portal %s: %d nota(s) encontrada(s) de %s a %s.",
-                    tipo, len(notas), data_inicio, data_fim)
-        return notas
+                    tipo, total, data_inicio, data_fim)
+
+        xmls = pdfs = captchas = erros = 0
+        registros_excel = []
+
+        for idx, nota in enumerate(notas_info):
+            numero       = nota.get("numero") or ""
+            data_emissao = nota.get("data_emissao", "")
+            valor        = nota.get("valor", "")
+            status_nota  = nota.get("status", "")
+            chave        = nota.get("chave_acesso", "")
+            link_xml     = nota.get("link_xml", "")
+            link_pdf     = nota.get("link_pdf", "")
+
+            nome_arq = numero or chave or f"nota_{idx+1}"
+            logger.info("  [%d/%d] #%s | %s | %s", idx+1, total, nome_arq, data_emissao, valor)
+
+            xml_baixado = pdf_baixado = False
+
+            # Volta para a página de listagem antes de cada download
+            # (evita perder o contexto de sessão)
+            if page.url.split("?")[0] != url_lista:
+                page.goto(url_lista, wait_until="domcontentloaded")
+                self._preencher_filtro_datas(data_inicio, data_fim)
+                page.wait_for_selector("tbody tr", timeout=10_000)
+
+            # --- Clica no link XML pela href exata na tabela ---
+            if link_xml:
+                dest = base_path / "xmls" / f"{nome_arq}.xml"
+                ok, st = self._clicar_link_download(link_xml, dest, "XML")
+                if ok:
+                    xmls += 1
+                    xml_baixado = True
+                    if st == self.RESULTADO_CAPTCHA:
+                        captchas += 1
+                    link_xml = ""
+                else:
+                    erros += 1
+
+            # --- Clica no link PDF pela href exata na tabela ---
+            if link_pdf:
+                dest = base_path / "pdfs" / f"{nome_arq}.pdf"
+                ok, st = self._clicar_link_download(link_pdf, dest, "PDF")
+                if ok:
+                    pdfs += 1
+                    pdf_baixado = True
+                    if st == self.RESULTADO_CAPTCHA:
+                        captchas += 1
+                    link_pdf = ""
+                else:
+                    erros += 1
+
+            registros_excel.append({
+                "empresa":      nome_empresa,
+                "cnpj":         cnpj,
+                "numero":       numero,
+                "data_emissao": data_emissao,
+                "valor":        valor,
+                "status":       status_nota,
+                "chave_acesso": chave,
+                "link_xml":     link_xml,
+                "link_pdf":     link_pdf,
+            })
+
+        # Relatório Excel
+        if registros_excel:
+            mes_ano = data_inicio.replace("/", "-")[3:]  # "05/2026" → "05-2026"
+            caminho_excel = base_path / f"relatorio_recebidas_{cnpj}_{mes_ano}.xlsx"
+            gerar_relatorio(registros_excel, caminho_excel)
+            logger.info("Relatório Excel: %s", caminho_excel)
+
+        return {"notas": total, "xmls": xmls, "pdfs": pdfs,
+                "captchas": captchas, "erros": erros,
+                "registros_excel": registros_excel}
 
     def _preencher_filtro_datas(self, data_inicio: str, data_fim: str) -> None:
         page = self._page
@@ -293,71 +374,105 @@ class PlaywrightScraper:
         return notas
 
     # ------------------------------------------------------------------
-    # Download de arquivos
+    # Download — clica no link dentro da tabela (não navega para URL direta)
     # ------------------------------------------------------------------
 
-    def baixar_arquivo(
+    def _clicar_link_download(
         self,
-        url: str,
+        href_alvo: str,
         destino: Path,
+        tipo_arquivo: str = "",
     ) -> tuple[bool, str]:
         """
-        Navega até a URL de download, resolve CAPTCHA se necessário,
-        e salva o arquivo em `destino`.
+        Localiza o link na tabela pelo href e clica nele.
+        Captura o download resultante e salva em `destino`.
 
-        Returns:
-            (sucesso: bool, status: str)
+        Estratégia:
+          1. Procura <a href="..."> na página cujo href bate com href_alvo
+          2. Clica — o portal processa a requisição com o contexto de sessão correto
+          3. Se aparecer CAPTCHA, aguarda resolução manual
+          4. Captura o arquivo baixado via expect_download()
         """
-        if not url:
-            return False, self.RESULTADO_ERRO
-
         page = self._page
-        logger.info("  Baixando: %s → %s", url, destino.name)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+
+        # Normaliza o href para comparação (remove domínio se presente)
+        href_relativo = href_alvo.replace("https://www.nfse.gov.br", "")
+
+        logger.info("  ⬇ %s → %s", tipo_arquivo, destino.name)
 
         try:
-            # Navega para a URL de download; usa expect_download para capturar o arquivo
+            # Localiza o elemento <a> pelo href
+            elemento = page.locator(f'a[href="{href_relativo}"]').first
+            if not elemento.is_visible(timeout=3_000):
+                # Tenta com URL completa
+                elemento = page.locator(f'a[href="{href_alvo}"]').first
+
+            captcha_apareceu = False
+
+            # Abre o menu dropdown da nota se o link não estiver visível
+            if not elemento.is_visible(timeout=2_000):
+                self._abrir_menu_nota_por_href(href_relativo)
+                time.sleep(0.5)
+
+            # Clica e captura o download
             with page.expect_download(timeout=_TIMEOUT_DOWN_MS) as dl_info:
-                page.goto(url, wait_until="commit", timeout=_TIMEOUT_NAV_MS)
+                elemento.click(timeout=5_000)
+                time.sleep(0.8)
 
-                # Verifica se apareceu CAPTCHA após navegar
-                captcha_apareceu = self._aguardar_captcha_se_necessario("download")
+                # Verifica CAPTCHA após o clique
+                captcha_apareceu = self._aguardar_captcha_se_necessario(tipo_arquivo)
 
-                # Se tiver um botão de confirmação após o CAPTCHA, clica
-                for seletor in ["button#btnDownload", "button.btn-download",
-                                 "a.btn-download", "input[value='Download']"]:
-                    try:
-                        page.click(seletor, timeout=3_000)
-                        break
-                    except Exception:
-                        continue
+                # Botão de confirmação pós-CAPTCHA (se existir)
+                if captcha_apareceu:
+                    for sel in ["button#btnDownload", "button.btn-confirmar",
+                                "input[value='Confirmar']", "button[type='submit']"]:
+                        try:
+                            page.click(sel, timeout=3_000)
+                            break
+                        except Exception:
+                            continue
 
-            download = dl_info.value
-            destino.parent.mkdir(parents=True, exist_ok=True)
-            download.save_as(str(destino))
-            logger.info("  ✅ Salvo: %s", destino)
+            dl = dl_info.value
+            dl.save_as(str(destino))
+            logger.info("  ✅ %s salvo: %s", tipo_arquivo, destino.name)
             status = self.RESULTADO_CAPTCHA if captcha_apareceu else self.RESULTADO_SUCESSO
             return True, status
 
         except Exception as exc:
-            # Se a página mostrou conteúdo (não gerou download), salva diretamente
-            conteudo = self._tentar_salvar_conteudo_pagina(url, destino)
-            if conteudo:
-                return True, self.RESULTADO_SUCESSO
+            # Fallback: tenta capturar conteúdo XML da página atual
+            if "xml" in tipo_arquivo.lower():
+                conteudo = self._salvar_xml_da_pagina(destino)
+                if conteudo:
+                    return True, self.RESULTADO_SUCESSO
 
-            logger.warning("  ⚠️  Falha ao baixar %s: %s", destino.name, exc)
+            logger.warning("  ⚠️  Falha %s (%s): %s", tipo_arquivo, destino.name, exc)
             return False, self.RESULTADO_ERRO
 
-    def _tentar_salvar_conteudo_pagina(self, url: str, destino: Path) -> bool:
-        """Tenta capturar o conteúdo atual da página como XML ou PDF."""
-        try:
-            content_type = ""
-            response = self._page.evaluate("() => document.contentType || ''")
-            content = self._page.content()
+    def _abrir_menu_nota_por_href(self, href_parcial: str) -> None:
+        """Clica no botão de ações da linha que contém o href alvo."""
+        page = self._page
+        linhas = page.query_selector_all("tbody tr")
+        for linha in linhas:
+            links = linha.query_selector_all("a")
+            for a in links:
+                if href_parcial in (a.get_attribute("href") or ""):
+                    # Abre o dropdown de ações dessa linha
+                    btn = linha.query_selector(
+                        "button.dropdown-toggle, a.dropdown-toggle, .btn-acoes"
+                    )
+                    if btn:
+                        btn.click()
+                        time.sleep(0.4)
+                    return
 
-            if "xml" in str(response).lower() or url.lower().endswith(".xml") or "<NFS" in content:
-                destino.parent.mkdir(parents=True, exist_ok=True)
+    def _salvar_xml_da_pagina(self, destino: Path) -> bool:
+        """Captura o conteúdo XML exibido diretamente na página."""
+        try:
+            content = self._page.content()
+            if "<NFS" in content or "<?xml" in content.lower():
                 destino.write_text(content, encoding="utf-8")
-                logger.info("  ✅ XML salvo via conteúdo de página: %s", destino)
+                logger.info("  ✅ XML capturado da página: %s", destino.name)
                 return True
         except Exception:
             pass

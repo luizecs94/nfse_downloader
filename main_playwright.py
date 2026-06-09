@@ -120,7 +120,6 @@ def _sincronizar_via_api(empresa: dict, inicio: datetime, fim: datetime) -> dict
 
 def _sincronizar_via_playwright(empresa: dict, inicio: datetime, fim: datetime) -> dict:
     from core.playwright_scraper import FalhaAutenticacaoError, PlaywrightScraper
-    from core.relatorio_excel import gerar_relatorio
 
     cnpj = empresa["cnpj"]
     nome = empresa["nome"]
@@ -133,89 +132,28 @@ def _sincronizar_via_playwright(empresa: dict, inicio: datetime, fim: datetime) 
     )
     base.mkdir(parents=True, exist_ok=True)
 
-    xmls = pdfs = captchas = erros = 0
-    registros_excel = []
-
-    with PlaywrightScraper(cnpj=cnpj, senha=empresa["senha"], pasta_downloads=base) as scraper:
+    with PlaywrightScraper(cnpj=cnpj, senha=empresa["senha"]) as scraper:
         try:
             scraper.autenticar()
         except FalhaAutenticacaoError as exc:
             logger.error("[%s] %s", nome, exc)
             return {"notas": 0, "xmls": 0, "pdfs": 0, "municipais": 0, "erros": 1}
 
-        notas_raw = scraper.listar_notas(
-            "recebidas",
-            inicio.strftime("%d/%m/%Y"),
-            fim.strftime("%d/%m/%Y"),
+        res = scraper.listar_e_baixar_notas(
+            tipo="recebidas",
+            data_inicio=inicio.strftime("%d/%m/%Y"),
+            data_fim=fim.strftime("%d/%m/%Y"),
+            base_path=base,
+            nome_empresa=nome,
+            cnpj=cnpj,
         )
 
-        total = len(notas_raw)
-        for idx, nota in enumerate(notas_raw, 1):
-            numero       = nota.get("numero") or ""
-            data_emissao = nota.get("data_emissao", "")
-            valor        = nota.get("valor", "")
-            status_nota  = nota.get("status", "")
-            chave        = nota.get("chave_acesso", "")
-            link_xml     = nota.get("link_xml", "")
-            link_pdf     = nota.get("link_pdf", "")
-
-            nome_arq = numero or chave or f"nota_{idx}"
-            logger.info("  [%d/%d] #%s | %s | %s", idx, total, nome_arq, data_emissao, valor)
-
-            xml_baixado = pdf_baixado = False
-
-            # --- Download XML ---
-            if link_xml:
-                dest_xml = base / "xmls" / f"{nome_arq}.xml"
-                ok, st = scraper.baixar_arquivo(link_xml, dest_xml)
-                if ok:
-                    xmls += 1
-                    xml_baixado = True
-                    if st == scraper.RESULTADO_CAPTCHA:
-                        captchas += 1
-                    link_xml = ""   # já salvo — remove do Excel
-                else:
-                    erros += 1
-
-            # --- Download PDF ---
-            if link_pdf:
-                dest_pdf = base / "pdfs" / f"{nome_arq}.pdf"
-                ok, st = scraper.baixar_arquivo(link_pdf, dest_pdf)
-                if ok:
-                    pdfs += 1
-                    pdf_baixado = True
-                    if st == scraper.RESULTADO_CAPTCHA:
-                        captchas += 1
-                    link_pdf = ""   # já salvo — remove do Excel
-                else:
-                    erros += 1
-
-            # Adiciona ao Excel (links só ficam se não foram baixados)
-            registros_excel.append({
-                "empresa":      nome,
-                "cnpj":         cnpj,
-                "numero":       numero,
-                "data_emissao": data_emissao,
-                "valor":        valor,
-                "status":       status_nota,
-                "chave_acesso": chave,
-                "link_xml":     link_xml,
-                "link_pdf":     link_pdf,
-            })
-
-    # Gera relatório Excel independente do resultado
-    if registros_excel:
-        mes_ano = inicio.strftime("%Y-%m")
-        caminho_excel = base / f"relatorio_recebidas_{cnpj}_{mes_ano}.xlsx"
-        gerar_relatorio(registros_excel, caminho_excel)
-        logger.info("[%s] Relatório Excel: %s", nome, caminho_excel)
-
     return {
-        "notas":      len(notas_raw),
-        "xmls":       xmls,
-        "pdfs":       pdfs,
-        "municipais": captchas,   # reuso do campo para "resolvidos por CAPTCHA"
-        "erros":      erros,
+        "notas":      res["notas"],
+        "xmls":       res["xmls"],
+        "pdfs":       res["pdfs"],
+        "municipais": res["captchas"],
+        "erros":      res["erros"],
     }
 
 
